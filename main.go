@@ -1,65 +1,53 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"net/http"
-	"os"
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	"github.com/victorspringer/http-cache"
-	"github.com/victorspringer/http-cache/adapter/memory"
+	"go.uber.org/zap"
 )
 
 var previousStatus *Status
 var nextStatus *Status
+var logger *zap.SugaredLogger
+var (
+	// FlagAddr for the server Addr
+	FlagAddr string = ":8080"
+	// FlagBotToken for the server BotToken
+	FlagBotToken string
+	// FlagDropDB to drop the database on start
+	FlagDropDB bool = false
+
+	// FlagCheckIntervalMinutes to check how often to check and notify subscribers
+	FlagCheckIntervalMinutes int = 5
+)
 
 func init() {
+	flag.StringVar(&FlagAddr, "addr", lookupEnvOrString("ADDR", FlagAddr), "Address to host from")
+	flag.StringVar(&FlagBotToken, "bot-token", lookupEnvOrString("BOT_TOKEN", FlagBotToken), "Telegram token")
+	flag.BoolVar(&FlagDropDB, "drop-db", lookupEnvOrBool("DROP_DB", FlagDropDB), "Drop the database")
+	flag.IntVar(&FlagCheckIntervalMinutes, "check-interval-minutes", lookupEnvOrInt("CHECK_INTERVAL_MINUTES", FlagCheckIntervalMinutes), "How often to check the server status")
+
+	flag.Parse()
+
+	zlogger, _ := zap.NewDevelopment()
+	defer zlogger.Sync() // flushes buffer, if any
+	logger = zlogger.Sugar()
+
 	nextStatus = &Status{RWMutex: &sync.RWMutex{}}
 	previousStatus = &Status{RWMutex: &sync.RWMutex{}}
 }
 func main() {
-	conn, err := initDB(false)
+	conn, err := initDB(FlagDropDB)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	memcached, err := memory.NewAdapter(
-		memory.AdapterWithAlgorithm(memory.LRU),
-		memory.AdapterWithCapacity(10000000),
-	)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	cacheClient, err := cache.NewClient(
-		cache.ClientWithAdapter(memcached),
-		cache.ClientWithTTL(1*time.Second),
-		cache.ClientWithRefreshKey("opn"),
-	)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-
-	handleStatus := cacheClient.Middleware(http.HandlerFunc(handleStatus))
-	r.Get("/", handleStatus.ServeHTTP)
-	r.Post("/subscribe", handleSubscribe(conn))
-	r.Get("/metrics", promhttp.Handler().ServeHTTP)
-
-	fmt.Println("Start server on :8080")
-	http.ListenAndServe(":8080", r)
+	StartAPI(conn, FlagAddr)
+	StartBot(conn, FlagBotToken, time.Duration(FlagCheckIntervalMinutes)*time.Minute)
+	select {}
 }
 
 // Status is the full app status
